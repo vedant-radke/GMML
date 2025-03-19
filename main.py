@@ -1,10 +1,3 @@
-IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
-
-
-import warnings
-warnings.filterwarnings("ignore")
-
 import argparse
 import os
 import sys
@@ -25,16 +18,15 @@ import torchvision
 from torchvision import models as torchvision_models
 from numpy.random import randint
 
-from datasets import load_dataset, datasets_utils
-
+# Import the modified dataset utilities
+from datasets import load_dataset
+from datasets.ped2_dataset import Ped2Dataset
+from datasets.datasets_utils import DataAugmentationSiT
+from datasets.ped2_data_augmentation import DataAugmentationPed2
 
 import utils
 import vision_transformer as vits
 from vision_transformer import RECHead
-
-torchvision_archs = sorted(name for name in torchvision_models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(torchvision_models.__dict__[name]))
 
 def get_args_parser():
     parser = argparse.ArgumentParser('SiTv2', add_help=False)
@@ -55,14 +47,14 @@ def get_args_parser():
     parser.add_argument('--drop_only', type=int, default=1, help='Align drop with patches')
 
     # Dataset
-    parser.add_argument('--data_set', default='Cars', type=str, 
-                        choices=['MNIST', 'CIFAR10', 'CIFAR100', 'Flowers', 'Aircraft', 'Cars', 'ImageNet5p', 'ImageNet10p', 'ImageNet', 'TinyImageNet', 'PASCALVOC', 'MSCOCO', 'VGenome', 'Pets'], 
+    parser.add_argument('--data_set', default='PED2', type=str, 
+                        choices=['MNIST', 'PED2', 'CIFAR10', 'CIFAR100', 'Flowers', 'Aircraft', 'Cars', 'ImageNet5p', 'ImageNet10p', 'ImageNet', 'TinyImageNet', 'PASCALVOC', 'MSCOCO', 'VGenome', 'Pets'], 
                         help='Name of the dataset.')
-    parser.add_argument('--data_location', default='.', type=str, help='Dataset location.')
+    parser.add_argument('--data_location', default='./data', type=str, help='Dataset location.')
 
     # Hyper-parameters
-    parser.add_argument('--batch_size', default=64, type=int, help="Batch size per GPU.")
-    parser.add_argument('--epochs', default=800, type=int, help="Number of epochs of training.")
+    parser.add_argument('--batch_size', default=32, type=int, help="Batch size per GPU.")
+    parser.add_argument('--epochs', default=200, type=int, help="Number of epochs of training.")
     
     parser.add_argument('--weight_decay', type=float, default=0.04, help="weight decay")
     parser.add_argument('--weight_decay_end', type=float, default=0.4, help="Final value of the weight decay.")
@@ -75,19 +67,20 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="Maximal parameter gradient norm.")
     parser.add_argument("--warmup_epochs", default=10, type=int, help="Number of epochs for the linear learning-rate warm up.")
 
-    # Multi-crop parameters  ---- Not needed for GMML (just to match number of updates to SOTA methods)
+    # Multi-crop parameters
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.25, 1.), help="Scale range of global crops")
     parser.add_argument('--local_crops_number', type=int, default=0, help="Number of local crops.")
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4), help="Scale range of local crops")
     
     # Misc
-    parser.add_argument('--output_dir', default="checkpoints/Cars", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--output_dir', default="checkpoints/PED2", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--saveckp_freq', default=10, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    
     return parser
 
 
@@ -100,14 +93,17 @@ def train_SiTv2(args):
     args.epochs += 1
 
     # Preparing Dataset
-    transform = datasets_utils.DataAugmentationSiT(args)    
-    dataset , _ = load_dataset.build_dataset(args, True, trnsfrm=transform)
+    if args.data_set == 'PED2':
+        transform = DataAugmentationPed2(args)
+    else:
+        transform = DataAugmentationSiT(args)
+        
+    dataset, _ = load_dataset.build_dataset(args, True, trnsfrm=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(dataset, sampler=sampler, batch_size=args.batch_size,
         num_workers=args.num_workers, pin_memory=True, drop_last=True)
     print(f"==> {args.data_set} training set is loaded.")
     print(f"-------> The dataset consists of {len(dataset)} images.")
-
 
     # Create Transformer
     SiT_model = vits.__dict__[args.model](img_size=[args.img_size])
@@ -120,7 +116,6 @@ def train_SiTv2(args):
     SiT_model = nn.parallel.DistributedDataParallel(SiT_model, device_ids=[args.gpu])
     print(f"==> {args.model} model is created.")
     print(f"-------> The model has {n_params} parameters.")
-    
     
     # Create Optimizer
     params_groups = utils.get_params_groups(SiT_model)
@@ -249,8 +244,6 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
 
 
 class FullpiplineSiT(nn.Module):
